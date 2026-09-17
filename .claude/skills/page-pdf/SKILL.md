@@ -1,6 +1,6 @@
 ---
 name: page-pdf
-description: Save a web page as a PDF in mobile or desktop view using Playwright, dismissing cookie/consent banners and forcing lazy-loaded content to load first. Use when asked to snapshot, archive, or "get a PDF of" a URL, in phone or desktop layout.
+description: Save a web page as a PDF in mobile or desktop view using Playwright, dismissing cookie/consent banners and forcing lazy-loaded content to load first. Handles sites behind HTTP basic auth (UAT/staging) without putting credentials on the command line. Use when asked to snapshot, archive, or "get a PDF of" a URL, in phone or desktop layout.
 ---
 
 # Page → PDF
@@ -13,6 +13,16 @@ scrolls the whole page so lazy content loads, then writes a PDF.
 ```bash
 npm install -D playwright          # needs Node 20+
 npx playwright install chromium
+```
+
+Nothing outside Node is required: the script uses only `path`, `fs`, `readline`
+and `child_process` plus playwright, so it runs the same on Linux and macOS with
+no Python, and no npm at run time. If `playwright` cannot be resolved from the
+script's directory upwards and there is no npm to ask, point `NODE_PATH` at an
+install:
+
+```bash
+NODE_PATH=/path/to/node_modules node save-pdf.js <url>
 ```
 
 Chromium 140 mis-rendered scroll-animated pages and crashed on stylesheets
@@ -48,6 +58,82 @@ Run with `--help` for the full option list. Output defaults to
 (status, title, consent buttons clicked, content height, page size, bytes) to
 stdout and progress to stderr, so `--quiet` plus stdout parsing is scriptable.
 
+## Sites behind HTTP basic auth (UAT)
+
+The password is never passed on the command line — it would land in `ps` output
+and shell history. Give the script a username and let it fetch the secret:
+
+```bash
+# 1. nothing configured: the 401 is caught and the terminal prompts (no echo)
+node .claude/skills/page-pdf/save-pdf.js https://uat.example.com --mobile
+
+# 2. from a secret manager — any command that prints the password on line 1
+node .claude/skills/page-pdf/save-pdf.js https://uat.example.com \
+  --auth uatuser --auth-cmd 'pass show uat/example'
+
+# printing "user:pass" instead means --auth can be dropped
+--auth-cmd 'op read "op://UAT/example.com/credential"'
+--auth-cmd 'secret-tool lookup service page-pdf host uat.example.com'
+--auth-cmd 'bw get password uat.example.com'
+
+# 3. from the environment, for CI or a non-interactive run
+PAGE_PDF_AUTH_UAT_EXAMPLE_COM='uatuser:s3cret' \
+  node .claude/skills/page-pdf/save-pdf.js https://uat.example.com --no-auth-prompt
+```
+
+Resolution order is `--auth-cmd`, then `$PAGE_PDF_AUTH_<HOST>` (hostname
+uppercased, non-alphanumerics to `_`) or the unscoped `$PAGE_PDF_AUTH`, then the
+hidden prompt. `--no-auth-prompt` turns a missing secret into an error instead.
+
+The helper runs with stdin and stderr attached to the terminal, so GPG pinentry,
+`op`'s biometric unlock and similar prompts still work.
+
+### Storing the secret
+
+With `pass` (GPG-backed, already on this machine):
+
+```bash
+pass insert uat/example            # prompts twice, stores encrypted
+```
+
+With libsecret / the desktop keyring (`sudo apt install libsecret-tools`):
+
+```bash
+secret-tool store --label='UAT example' service page-pdf host uat.example.com
+```
+
+On macOS the login Keychain is already there, no install needed:
+
+```bash
+# store (omit the value after -w and it prompts instead of taking it from argv)
+security add-generic-password -s page-pdf -a uat.example.com -w
+
+# read it back — this is the --auth-cmd
+node .claude/skills/page-pdf/save-pdf.js https://uat.example.com --auth uatuser \
+  --auth-cmd 'security find-generic-password -s page-pdf -a uat.example.com -w'
+```
+
+The first read pops a Keychain access dialog; "Always Allow" makes it silent
+afterwards. Over SSH or in a headless session the Keychain may be locked —
+`security unlock-keychain` first, or fall back to the environment variable.
+
+### Where the credentials go
+
+They are scoped to the URL's origin (`scheme://host[:port]`) and sent only on a
+401 challenge, so a CDN, an analytics host or an off-site redirect never sees an
+`Authorization` header. If the UAT login covers more than one origin, list them:
+
+```bash
+--auth-origin 'https://uat.example.com,https://assets-uat.example.com'
+```
+
+The JSON summary reports the username, the source it came from and the origins —
+never the password. The password lives only in memory for the life of the run.
+
+A 401 that survives with credentials in hand fails the run with
+`401 Unauthorized: <user> was rejected by <host>` rather than quietly writing a
+PDF of the "Unauthorized" page.
+
 ## Checking the result
 
 Chromium's own PDF engine renders the page: one tall page at the viewport width,
@@ -58,6 +144,10 @@ check the flow, then crop a region at full resolution to check text:
 pdftoppm -png -r 11 out.pdf /tmp/check                            # whole page
 pdftoppm -png -r 72 -f 2 -l 2 -y 300 -H 900 out.pdf /tmp/crop     # detail
 ```
+
+`pdftoppm`/`pdftotext` are poppler, which macOS does not ship: `brew install
+poppler`. Without it, `qlmanage -t -s 2000 -o /tmp out.pdf` renders page 1 only,
+which is not enough to check a tall capture.
 
 ## What it handles automatically
 
@@ -98,7 +188,8 @@ pdftoppm -png -r 72 -f 2 -l 2 -y 300 -H 900 out.pdf /tmp/crop     # detail
   below the footer.
 - Scroll-driven sections (pinned heroes, scrub animations, parallax) render at
   whatever state the print layout resolves to, not mid-animation.
-- Sites behind a login, hard bot-detection, or geo-blocking are out of scope.
+- Form-based logins, SSO, hard bot-detection and geo-blocking are out of scope.
+  HTTP basic auth is supported — see above.
 - Firefox's built-in PDF viewer (pdf.js) tints these PDFs pink — it mishandles
   the ICC-tagged RGB images Chromium embeds. The file is fine; check it in
   Chromium, or with `pdftoppm`. `--page-height` splits the output into smaller

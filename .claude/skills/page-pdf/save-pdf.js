@@ -3,6 +3,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const readline = require('readline');
 const { execSync } = require('child_process');
 
 function loadPlaywright() {
@@ -10,12 +11,19 @@ function loadPlaywright() {
     return require('playwright');
   } catch (_) {}
   try {
-    const globalRoot = execSync('npm root -g', { encoding: 'utf8' }).trim();
+    // stderr is ignored: a standalone node binary often has no npm alongside it,
+    // and "npm: not found" ahead of the real message only confuses.
+    const globalRoot = execSync('npm root -g', {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim();
     return require(path.join(globalRoot, 'playwright'));
   } catch (_) {}
   console.error(
     'playwright not found. Install it in this project (or globally):\n' +
-      '  npm install -D playwright && npx playwright install chromium'
+      '  npm install -D playwright && npx playwright install chromium\n' +
+      'With a standalone node binary and no npm, point NODE_PATH at an existing\n' +
+      'install instead:  NODE_PATH=/path/to/node_modules node save-pdf.js <url>'
   );
   process.exit(1);
 }
@@ -95,6 +103,10 @@ function parseArgs(argv) {
     maxScrolls: 60,
     settle: 350,
     consentTimeout: 12000,
+    authUser: null,
+    authCmd: null,
+    authOrigin: null,
+    authPrompt: true,
     revealSettle: 2500,
     forceReveal: false,
     keepBanners: false,
@@ -123,6 +135,10 @@ function parseArgs(argv) {
       case '--force-reveal': opts.forceReveal = true; break;
       case '--reveal-settle': opts.revealSettle = parseInt(next(), 10); break;
       case '--consent-timeout': opts.consentTimeout = parseInt(next(), 10); break;
+      case '--auth': opts.authUser = next(); break;
+      case '--auth-cmd': opts.authCmd = next(); break;
+      case '--auth-origin': opts.authOrigin = next(); break;
+      case '--no-auth-prompt': opts.authPrompt = false; break;
       case '--keep-banners': opts.keepBanners = true; break;
       case '--print-css': opts.printCss = true; break;
       case '--scale': opts.scale = parseFloat(next()); break;
@@ -158,6 +174,20 @@ const USAGE = `Usage: node save-pdf.js <url> [options]
   --keep-banners           do not dismiss cookie/consent banners
   --consent-timeout <ms>   how long to wait for a consent banner (default 12000)
   --quiet                  only print the result JSON
+
+HTTP basic auth (UAT sites). The password is never taken on the command line;
+it comes from a secret manager, an environment variable, or a hidden prompt:
+
+  --auth <user>            username for basic auth (password resolved below)
+  --auth-cmd "<command>"   shell command printing the password, or "user:pass",
+                           on its first line, e.g. 'pass show uat/acme'
+  --auth-origin <origin>   send credentials to this origin instead of the URL's
+                           (scheme://host[:port]); repeat with commas
+  --no-auth-prompt         fail instead of prompting when nothing else resolves
+
+  Credentials resolve in order: --auth-cmd, $PAGE_PDF_AUTH_<HOST> or
+  $PAGE_PDF_AUTH ("user:pass"), then a hidden terminal prompt. A bare 401 with
+  no credentials configured re-prompts and retries once.
 `;
 
 function log(opts, ...args) {
@@ -168,6 +198,154 @@ function slugify(url, mode) {
   const u = new URL(url);
   const pathPart = u.pathname.replace(/\/+$/, '').replace(/^\//, '').replace(/[^\w.-]+/g, '-');
   return [u.hostname.replace(/^www\./, ''), pathPart, mode].filter(Boolean).join('-').slice(0, 120);
+}
+
+// --- HTTP basic auth ---------------------------------------------------------
+// The password never appears in argv, so it stays out of `ps`, shell history and
+// the JSON summary. It is read from a secret manager (--auth-cmd), the
+// environment, or a hidden prompt, and only ever lives in memory.
+
+function envVarFor(url) {
+  return `PAGE_PDF_AUTH_${new URL(url).hostname.toUpperCase().replace(/[^A-Z0-9]+/g, '_')}`;
+}
+
+function splitPair(raw) {
+  const i = raw.indexOf(':');
+  return i === -1 ? [null, raw] : [raw.slice(0, i), raw.slice(i + 1)];
+}
+
+// The helper inherits stdin and stderr so GPG/pinentry, `op`, biometric prompts
+// and the like can talk to the terminal; only stdout is captured.
+function runAuthCmd(cmd) {
+  let out;
+  try {
+    out = execSync(cmd, {
+      encoding: 'utf8',
+      stdio: ['inherit', 'pipe', 'inherit'],
+      timeout: 120000,
+    });
+  } catch (err) {
+    const why = err.status !== undefined ? `exit ${err.status}` : err.message;
+    throw new Error(`--auth-cmd failed: ${cmd} (${why})`);
+  }
+  // The password is the first line verbatim, the convention `pass`, `security`
+  // and git credential helpers all follow. Only the line ending is stripped, so
+  // a password with significant leading or trailing spaces survives.
+  const first = out.split('\n')[0].replace(/\r$/, '');
+  if (!first.trim()) throw new Error(`--auth-cmd printed nothing: ${cmd}`);
+  return first;
+}
+
+function promptLine(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stderr, terminal: true });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer.trim());
+    });
+  });
+}
+
+// readline has no echo-off mode, so drive the tty directly.
+const KEY_ENTER = ['\r', '\n', '\u0004'];
+const KEY_ABORT = '\u0003';
+const KEY_ERASE = ['\u007f', '\b'];
+
+function promptSecret(question) {
+  return new Promise((resolve, reject) => {
+    const input = process.stdin;
+    const wasRaw = input.isRaw;
+    let buf = '';
+    const done = () => {
+      input.removeListener('data', onData);
+      input.setRawMode(wasRaw === true);
+      input.pause();
+      process.stderr.write('\n');
+    };
+    const onData = (chunk) => {
+      for (const ch of chunk) {
+        if (KEY_ENTER.includes(ch)) { done(); resolve(buf); return; }
+        if (ch === KEY_ABORT) { done(); reject(new Error('cancelled')); return; }
+        if (KEY_ERASE.includes(ch)) { buf = buf.slice(0, -1); continue; }
+        buf += ch;
+      }
+    };
+    process.stderr.write(question);
+    input.setRawMode(true);
+    input.resume();
+    input.setEncoding('utf8');
+    input.on('data', onData);
+  });
+}
+
+function canPrompt(opts) {
+  return opts.authPrompt && process.stdin.isTTY && process.stderr.isTTY;
+}
+
+// Credentials are scoped to an origin so they are never offered to a CDN,
+// analytics host or an off-site redirect the page happens to pull in.
+function authOrigins(opts) {
+  const raw = opts.authOrigin || new URL(opts.url).origin;
+  return raw
+    .split(',')
+    .map((o) => o.trim().replace(/\/+$/, ''))
+    .filter(Boolean);
+}
+
+function httpCredentialsFor(opts, creds) {
+  return authOrigins(opts).map((origin) => ({
+    username: creds.username,
+    password: creds.password,
+    origin,
+  }));
+}
+
+// Returns { username, password, source } or null when nothing is configured.
+async function resolveCredentials(opts, { interactive }) {
+  let username = opts.authUser;
+  let password = null;
+  let source = null;
+
+  if (opts.authCmd) {
+    const out = runAuthCmd(opts.authCmd);
+    if (username) {
+      password = out;
+    } else {
+      [username, password] = splitPair(out);
+    }
+    source = 'auth-cmd';
+  }
+
+  if (!password) {
+    const scoped = envVarFor(opts.url);
+    const name = process.env[scoped] ? scoped : process.env.PAGE_PDF_AUTH ? 'PAGE_PDF_AUTH' : null;
+    if (name) {
+      const [envUser, envPass] = splitPair(process.env[name]);
+      username = username || envUser;
+      password = envPass;
+      source = `env:${name}`;
+    }
+  }
+
+  if (!password && interactive && canPrompt(opts)) {
+    const where = authOrigins(opts)[0];
+    if (!username) username = await promptLine(`  basic-auth username for ${where}: `);
+    if (!username) throw new Error('no username given');
+    password = await promptSecret(`  basic-auth password for ${username}@${where}: `);
+    source = 'prompt';
+  }
+
+  if (!password) {
+    if (username || opts.authCmd) {
+      throw new Error(
+        `no password for ${username || 'basic auth'}: set ${envVarFor(opts.url)}="user:pass", ` +
+          'pass --auth-cmd "<command printing the password>", or run on a terminal to be prompted'
+      );
+    }
+    return null;
+  }
+  if (!username) throw new Error('basic auth needs a username: pass --auth <user>');
+  return { username, password, source };
 }
 
 // Consent dialogs are routinely taller than the viewport or covered by their
@@ -544,15 +722,49 @@ async function render(opts) {
   // No --font-render-hinting override: it shifts text metrics, so the measured
   // layout and the print layout disagree and the footer rides up over the last
   // section's content.
+  // Only prompt up front if the caller asked for auth; otherwise wait for the
+  // site to actually challenge, so public pages stay a one-command capture.
+  // Resolved before the browser starts, so a bad helper fails without leaving
+  // a Chromium behind.
+  const authRequested = Boolean(opts.authUser || opts.authCmd || opts.authOrigin);
+  let creds = await resolveCredentials(opts, { interactive: authRequested });
+
   const browser = await chromium.launch({ args: ['--disable-dev-shm-usage', '--disable-gpu'] });
-  const context = await browser.newContext(contextOptions);
-  const page = await context.newPage();
-  page.setDefaultTimeout(opts.timeout);
+  const openContext = async () => {
+    const ctx = await browser.newContext(
+      creds ? { ...contextOptions, httpCredentials: httpCredentialsFor(opts, creds) } : contextOptions
+    );
+    const pg = await ctx.newPage();
+    pg.setDefaultTimeout(opts.timeout);
+    return { ctx, pg };
+  };
+
+  let { ctx: context, pg: page } = await openContext();
 
   const result = { url: opts.url, mode, device: deviceName || 'desktop', output: outPath };
   try {
     log(opts, `→ ${opts.url} (${mode}${deviceName ? `, ${deviceName}` : ''})`);
-    const response = await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: opts.timeout });
+    if (creds) log(opts, `  basic auth as ${creds.username} (${creds.source}) for ${authOrigins(opts).join(', ')}`);
+    let response = await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: opts.timeout });
+
+    // A 401 with no credentials in hand would otherwise be captured as a PDF of
+    // the "Unauthorized" page. Ask once, rebuild the context, and retry.
+    if (response && response.status() === 401 && !creds && canPrompt(opts)) {
+      log(opts, `  ${new URL(opts.url).host} asked for HTTP basic auth`);
+      creds = await resolveCredentials(opts, { interactive: true });
+      await context.close();
+      ({ ctx: context, pg: page } = await openContext());
+      response = await page.goto(opts.url, { waitUntil: 'domcontentloaded', timeout: opts.timeout });
+    }
+    if (response && response.status() === 401) {
+      throw new Error(
+        creds
+          ? `401 Unauthorized: ${creds.username} was rejected by ${new URL(opts.url).host}`
+          : `401 Unauthorized: ${new URL(opts.url).host} needs HTTP basic auth — pass --auth <user> ` +
+            `(with --auth-cmd or ${envVarFor(opts.url)} for the password)`
+      );
+    }
+    if (creds) result.auth = { username: creds.username, source: creds.source, origins: authOrigins(opts) };
     result.status = response ? response.status() : null;
     await page.waitForLoadState('load', { timeout: opts.timeout }).catch(() => {});
     await page.waitForTimeout(1200);
